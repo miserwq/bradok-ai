@@ -481,9 +481,11 @@ def is_addressed(message, text, chat_type):
 # GROQ AI
 # -------------------------
 
+
 def ask_bradok(chat_id):
     history = get_history(chat_id)
-        memories = get_memories(chat_id)
+
+    memories = get_memories(chat_id)
 
     if memories:
         memory_context = "\n".join(
@@ -491,6 +493,7 @@ def ask_bradok(chat_id):
         )
     else:
         memory_context = "Пока важных воспоминаний нет."
+
     members = get_known_members(chat_id)
 
     system_prompt = SYSTEM_PROMPT
