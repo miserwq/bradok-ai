@@ -1,0 +1,9 @@
+
+services:
+  - type: worker
+    name: bradok-ai
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    autoDeploy: true
