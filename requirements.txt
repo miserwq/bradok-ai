@@ -4,4 +4,4 @@ requests
 openai
 psycopg2-binary
 gunicorn
-edge-tts
+gTTS
