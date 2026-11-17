@@ -1,5 +1,7 @@
+
 flask
-openai
 requests
-gunicorn
+openai
 psycopg2-binary
+gunicorn
+edge-tts
