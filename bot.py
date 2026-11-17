@@ -91,7 +91,7 @@ def webhook():
 
     try:
         result = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": text},
