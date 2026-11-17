@@ -1,4 +1,4 @@
-
+import json
 import os
 import logging
 from contextlib import contextmanager
@@ -123,6 +123,23 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_messages_chat_id
                 ON messages (chat_id, id DESC)
             """)
+                        cur.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id BIGSERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT,
+                    fact TEXT NOT NULL,
+                    category TEXT DEFAULT 'general',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (chat_id, user_id, fact)
+                )
+            """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_memories_user
+                ON memories (chat_id, user_id)
+            """)
 
     logger.info("Neon database initialized!")
 
@@ -231,7 +248,139 @@ def get_known_members(chat_id):
             members.append(full_name)
 
     return members
+def save_memory(chat_id, user_id, fact, category="general"):
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO memories (
+                    chat_id, user_id, fact, category
+                )
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (chat_id, user_id, fact)
+                DO UPDATE SET
+                    category = EXCLUDED.category,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (chat_id, user_id, fact, category))
 
+
+def get_memories(chat_id, user_id=None, limit=30):
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            if user_id is not None:
+                cur.execute("""
+                    SELECT fact
+                    FROM memories
+                    WHERE chat_id = %s AND user_id = %s
+                    ORDER BY updated_at DESC
+                    LIMIT %s
+                """, (chat_id, user_id, limit))
+            else:
+                cur.execute("""
+                    SELECT fact
+                    FROM memories
+                    WHERE chat_id = %s
+                    ORDER BY updated_at DESC
+                    LIMIT %s
+                """, (chat_id, limit))
+
+            return [row[0] for row in cur.fetchall()]
+
+def extract_and_save_memories(chat_id, message, text):
+    user = message.get("from", {})
+    user_id = user.get("id")
+
+    if not user_id or user.get("is_bot"):
+        return
+
+    lowered = text.lower()
+
+    # Не тратим запросы Groq на обычный трёп
+    triggers = [
+        "запомни", "меня зовут", "я люблю", "обожаю",
+        "мне нравится", "мой любимый", "моя любимая",
+        "ненавижу", "увлекаюсь", "работаю", "учусь",
+        "живу", "родился", "родилась", "день рождения",
+        "у меня есть", "моя девушка", "мой парень",
+        "моего друга", "мою подругу"
+    ]
+
+    if not any(word in lowered for word in triggers):
+        return
+
+    try:
+        result = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+Ты извлекаешь полезные долговременные воспоминания
+из сообщений Telegram.
+
+Верни строго JSON такого формата:
+{
+  "memories": [
+    {
+      "fact": "Любит пиццу",
+      "category": "preference"
+    }
+  ]
+}
+
+Правила:
+- Извлекай только факты, которые действительно есть в сообщении.
+- Не придумывай информацию.
+- Максимум 3 факта.
+- Сохраняй предпочтения, интересы, хобби,
+  важные даты и факты о людях.
+- Не сохраняй пароли, финансовые данные,
+  медицинские сведения и другие чувствительные подробности.
+- Не сохраняй случайные шутки и временные события.
+- Если полезных фактов нет, верни {"memories": []}.
+- Факты должны быть короткими и понятными.
+"""
+                },
+                {
+                    "role": "user",
+                    "content": text
+                }
+            ],
+            temperature=0.1,
+            max_tokens=250
+        )
+
+        content = result.choices[0].message.content or ""
+        content = content.strip()
+
+        # Убираем возможные Markdown-ограждения
+        if content.startswith("```"):
+            content = content.replace("```json", "", 1)
+            content = content.replace("```", "").strip()
+
+        data = json.loads(content)
+
+        memories = data.get("memories", [])
+
+        for item in memories[:3]:
+            fact = item.get("fact", "").strip()
+            category = item.get("category", "general")
+
+            if fact and len(fact) <= 300:
+                save_memory(
+                    chat_id,
+                    user_id,
+                    fact,
+                    category
+                )
+
+                logger.info(
+                    "Saved memory for user %s: %s",
+                    user_id,
+                    fact
+                )
+
+    except Exception:
+        logger.exception("Memory extraction failed")
 
 # -------------------------
 # TELEGRAM
@@ -326,6 +475,14 @@ def is_addressed(message, text, chat_type):
 
 def ask_bradok(chat_id):
     history = get_history(chat_id)
+        memories = get_memories(chat_id)
+
+    if memories:
+        memory_context = "\n".join(
+            f"- {fact}" for fact in memories
+        )
+    else:
+        memory_context = "Пока важных воспоминаний нет."
     members = get_known_members(chat_id)
 
     system_prompt = SYSTEM_PROMPT
@@ -340,8 +497,16 @@ def ask_bradok(chat_id):
     result = client.chat.completions.create(
         model="openai/gpt-oss-120b",
         messages=[
-            {"role": "system", "content": system_prompt},
-            *history
+    {
+        "role": "system",
+        "content": SYSTEM_PROMPT
+        + "\n\nТВОЯ ДОЛГОВРЕМЕННАЯ ПАМЯТЬ О КЕНТАХ:\n"
+        + memory_context
+        + "\nИспользуй эти факты, когда они относятся к разговору. "
+          "Не выдумывай воспоминания."
+    },
+    *history
+],
         ],
         temperature=0.9,
         max_tokens=700
@@ -410,6 +575,12 @@ def webhook():
         if not inserted:
             return jsonify(ok=True)
 
+                # Автоматически извлекаем важные воспоминания
+        extract_and_save_memories(
+            chat_id,
+            message,
+            text
+        )
         # В группе отвечаем только на обращения
         if chat_type in ("group", "supergroup") and not addressed:
             return jsonify(ok=True)
