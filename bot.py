@@ -503,6 +503,140 @@ def save_personality_from_message(chat_id, message, text):
 
 
 # -------------------------
+# ROAST MODE
+# -------------------------
+
+def generate_roast(chat_id, target_user_id, target_name):
+    personality_data = get_personality(
+        chat_id,
+        target_user_id
+    )
+
+    personality = "Характер пока неизвестен."
+    roast_level = 2
+
+    if personality_data:
+        personality = personality_data["personality"]
+        roast_level = personality_data["roast_level"]
+
+    if roast_level == 0:
+        return (
+            f"🛡 {target_name}, у тебя иммунитет от прожарки. "
+            "Брадок уважает личные границы, живи спокойно 😂"
+        )
+
+    roast_level = max(1, min(5, int(roast_level)))
+
+    prompt = f"""
+Ты — Брадок AI, дерзкий и харизматичный король дружеских прожарок.
+
+Твоя задача — придумать смешную персональную прожарку.
+
+ЦЕЛЬ:
+{target_name}
+
+ХАРАКТЕР ЧЕЛОВЕКА:
+{personality}
+
+УРОВЕНЬ ПРОЖАРКИ:
+{roast_level} из 5.
+
+СТИЛЬ:
+- Будь дерзким, смешным, наглым и саркастичным.
+- Используй современный интернет-сленг.
+- Мат разрешён, но естественно.
+- Подкалывай человека по-дружески.
+- Чем выше уровень, тем острее шутки.
+- Не выдумывай реальные факты о человеке.
+- Не используй чувствительные личные данные.
+- Не трогай здоровье, национальность, религию,
+  сексуальность, инвалидность и другие защищённые признаки.
+- Не унижай человека по-настоящему и не призывай к травле.
+- Не выдавай инструкции, угрозы или пожелания вреда.
+- Не повторяй каждый раз одну и ту же шутку.
+- Напиши 2-4 предложения.
+- Не объясняй, что ты искусственный интеллект.
+
+Выдай одну мощную дружескую прожарку.
+"""
+
+    try:
+        result = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {
+                    "role": "system",
+                    "content": prompt
+                },
+                {
+                    "role": "user",
+                    "content": f"Прожарь {target_name}!"
+                }
+            ],
+            temperature=1.0,
+            max_tokens=250
+        )
+
+        answer = result.choices[0].message.content
+
+        if not answer:
+            return "Бля, даже прожарка не загрузилась 😂"
+
+        return answer.strip()
+
+    except Exception:
+        logger.exception("Roast generation failed")
+        return "Бля, печь временно сломалась. Попробуем позже 😂"
+
+
+def handle_roast_command(chat_id, message):
+    reply = message.get("reply_to_message")
+
+    if not reply:
+        send_message(
+            chat_id,
+            "🔥 Чтобы прожарить кента, ответь командой /roast "
+            "на его сообщение.",
+            reply_to=message.get("message_id")
+        )
+        return
+
+    target = reply.get("from", {})
+    target_user_id = target.get("id")
+
+    if not target_user_id:
+        send_message(
+            chat_id,
+            "Не могу определить, кого прожаривать. "
+            "Ответь на обычное сообщение участника 😂",
+            reply_to=message.get("message_id")
+        )
+        return
+
+    if target.get("is_bot"):
+        send_message(
+            chat_id,
+            "Ботов не жарим. У них и так жизнь нелёгкая 🤖",
+            reply_to=message.get("message_id")
+        )
+        return
+
+    target_name = get_user_name(reply)
+
+    roast = generate_roast(
+        chat_id,
+        target_user_id,
+        target_name
+    )
+
+    send_message(
+        chat_id,
+        f"🔥 ПРОЖАРКА: {target_name}\n\n{roast}",
+        reply_to=message.get("message_id")
+    )
+
+
+# -------------------------
 # TELEGRAM
 # -------------------------
 
@@ -514,7 +648,14 @@ def telegram_request(method, data=None):
     )
 
     response.raise_for_status()
-    return response.json()
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(
+            f"Telegram API error: {result}"
+        )
+
+    return result
 
 
 def setup_webhook():
@@ -596,7 +737,6 @@ def is_addressed(message, text, chat_type):
 def ask_bradok(chat_id, user_id=None):
     history = get_history(chat_id)
 
-    # Загружаем личные воспоминания собеседника
     memories = get_memories(chat_id, user_id)
 
     if memories:
@@ -624,7 +764,6 @@ def ask_bradok(chat_id, user_id=None):
         "Не выдумывай воспоминания."
     )
 
-    # Загружаем индивидуальный характер
     personality_data = None
 
     if user_id is not None:
@@ -696,8 +835,38 @@ def webhook():
     if not text or not chat_id:
         return jsonify(ok=True)
 
+    # -------------------------
+    # COMMANDS
+    # -------------------------
+
     if text.startswith("/"):
+        command = text.split()[0].split("@")[0].lower()
+
+        if command == "/roast":
+            try:
+                handle_roast_command(chat_id, message)
+
+            except Exception:
+                logger.exception("Roast command failed")
+
+                try:
+                    send_message(
+                        chat_id,
+                        "Бля, прожарка не удалась. "
+                        "Печь дала сбой 😂",
+                        reply_to=message.get("message_id")
+                    )
+                except Exception:
+                    logger.exception("Telegram roast error")
+
+            return jsonify(ok=True)
+
+        # Остальные команды пока игнорируем
         return jsonify(ok=True)
+
+    # -------------------------
+    # NORMAL MESSAGES
+    # -------------------------
 
     user = message.get("from", {})
     user_id = user.get("id")
@@ -749,7 +918,8 @@ def webhook():
         try:
             send_message(
                 chat_id,
-                "Бля, небольшая техническая заминка. Попробуй ещё раз 😂",
+                "Бля, небольшая техническая заминка. "
+                "Попробуй ещё раз 😂",
                 reply_to=message.get("message_id")
             )
         except Exception:
