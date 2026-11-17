@@ -10,11 +10,14 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 RENDER_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
+)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
