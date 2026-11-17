@@ -2,10 +2,14 @@
 import json
 import os
 import logging
+import asyncio
+import tempfile
+
 from contextlib import contextmanager
 
 import requests
 import psycopg2
+import edge_tts
 
 from flask import Flask, request, jsonify
 from openai import OpenAI
@@ -35,6 +39,9 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 MAX_HISTORY = 24
 BOT_USERNAME = None
+
+# Голос Брадка
+TTS_VOICE = "ru-RU-DmitryNeural"
 
 
 SYSTEM_PROMPT = """
@@ -637,6 +644,94 @@ def handle_roast_command(chat_id, message):
 
 
 # -------------------------
+# VOICE MODE
+# -------------------------
+
+def wants_voice(text):
+    lowered = text.lower()
+
+    triggers = [
+        "скажи голосом",
+        "ответь голосом",
+        "ответь войсом",
+        "скажи войсом",
+        "голосом ответь",
+        "озвучь ответ",
+        "запиши голосовое",
+        "голосовое сообщение"
+    ]
+
+    return any(trigger in lowered for trigger in triggers)
+
+
+async def create_voice_file(text, file_path):
+    communicate = edge_tts.Communicate(
+        text=text,
+        voice=TTS_VOICE,
+        rate="+0%",
+        volume="+0%"
+    )
+
+    await communicate.save(file_path)
+
+
+def send_voice(chat_id, text, reply_to=None):
+    file_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            suffix=".mp3",
+            delete=False
+        ) as temp_file:
+            file_path = temp_file.name
+
+        # Создаём озвучку
+        asyncio.run(
+            create_voice_file(text, file_path)
+        )
+
+        data = {
+            "chat_id": chat_id
+        }
+
+        if reply_to:
+            data["reply_to_message_id"] = reply_to
+
+        # Отправляем именно голосовое сообщение
+        with open(file_path, "rb") as audio:
+            response = requests.post(
+                f"{TELEGRAM_API}/sendVoice",
+                data=data,
+                files={
+                    "voice": (
+                        "bradok_voice.mp3",
+                        audio,
+                        "audio/mpeg"
+                    )
+                },
+                timeout=120
+            )
+
+        response.raise_for_status()
+        result = response.json()
+
+        if not result.get("ok"):
+            raise RuntimeError(
+                f"Telegram voice error: {result}"
+            )
+
+        logger.info("Voice message sent!")
+
+    except Exception:
+        logger.exception("Voice generation or sending failed")
+        raise
+
+    finally:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+
+
+# -------------------------
 # TELEGRAM
 # -------------------------
 
@@ -861,7 +956,6 @@ def webhook():
 
             return jsonify(ok=True)
 
-        # Остальные команды пока игнорируем
         return jsonify(ok=True)
 
     # -------------------------
@@ -882,35 +976,51 @@ def webhook():
             text
         )
 
-        # Не обрабатываем повторно одно и то же сообщение
         if not inserted:
             return jsonify(ok=True)
 
-        # Сохраняем воспоминания
         extract_and_save_memories(
             chat_id,
             message,
             text
         )
 
-        # Сохраняем характер участника
         save_personality_from_message(
             chat_id,
             message,
             text
         )
 
-        # В группе отвечаем только на обращения к боту
         if chat_type in ("group", "supergroup") and not addressed:
             return jsonify(ok=True)
 
+        # Проверяем, просили ли ответить голосом
+        voice_requested = wants_voice(text)
+
         answer = ask_bradok(chat_id, user_id)
 
-        send_message(
-            chat_id,
-            answer,
-            reply_to=message.get("message_id")
-        )
+        if voice_requested:
+            try:
+                send_voice(
+                    chat_id,
+                    answer,
+                    reply_to=message.get("message_id")
+                )
+
+            except Exception:
+                # Если голос не получился, отправляем текст
+                send_message(
+                    chat_id,
+                    answer,
+                    reply_to=message.get("message_id")
+                )
+
+        else:
+            send_message(
+                chat_id,
+                answer,
+                reply_to=message.get("message_id")
+            )
 
     except Exception:
         logger.exception("Message processing error")
