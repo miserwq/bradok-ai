@@ -106,7 +106,18 @@ def init_db():
                 )
             """)
 
-           
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS personalities (
+                    id BIGSERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    personality TEXT NOT NULL,
+                    roast_level INTEGER DEFAULT 2,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (chat_id, user_id)
+                )
+            """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id BIGSERIAL PRIMARY KEY,
@@ -292,6 +303,84 @@ def get_memories(chat_id, user_id=None, limit=30):
                 """, (chat_id, limit))
 
             return [row[0] for row in cur.fetchall()]
+
+def save_personality(chat_id, user_id, personality, roast_level=2):
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO personalities (
+                    chat_id, user_id, personality, roast_level
+                )
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (chat_id, user_id)
+                DO UPDATE SET
+                    personality = EXCLUDED.personality,
+                    roast_level = EXCLUDED.roast_level,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (chat_id, user_id, personality, roast_level))
+
+
+def get_personality(chat_id, user_id):
+    
+def save_personality_from_message(chat_id, message, text):
+    user = message.get("from", {})
+    user_id = user.get("id")
+
+    if not user_id or user.get("is_bot"):
+        return
+
+    lowered = text.lower()
+
+    triggers = [
+        "запомни мой характер",
+        "мой характер:",
+        "общайся со мной"
+    ]
+
+    if not any(trigger in lowered for trigger in triggers):
+        return
+
+    if ":" in text:
+        personality = text.split(":", 1)[1].strip()
+    else:
+        personality = text.strip()
+
+    if not personality or len(personality) > 500:
+        return
+
+    roast_level = 2
+
+    if any(word in lowered for word in ["не подкалывай", "без подколов"]):
+        roast_level = 0
+    elif any(word in lowered for word in ["жёстко прожаривай", "подкалывай меня"]):
+        roast_level = 5
+
+    save_personality(
+        chat_id,
+        user_id,
+        personality,
+        roast_level
+    )
+
+    logger.info("Personality saved for user %s", user_id)
+
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT personality, roast_level
+                FROM personalities
+                WHERE chat_id = %s AND user_id = %s
+            """, (chat_id, user_id))
+
+            row = cur.fetchone()
+
+            if row:
+                return {
+                    "personality": row[0],
+                    "roast_level": row[1]
+                }
+
+            return None
 
 def extract_and_save_memories(chat_id, message, text):
     user = message.get("from", {})
@@ -482,7 +571,7 @@ def is_addressed(message, text, chat_type):
 # -------------------------
 
 
-def ask_bradok(chat_id):
+def ask_bradok(chat_id, user_id=None):
     history = get_history(chat_id)
 
     memories = get_memories(chat_id)
@@ -503,6 +592,19 @@ def ask_bradok(chat_id):
             "\n\nУЧАСТНИКИ ЭТОГО ЧАТА, КОТОРЫХ ТЫ ЗНАЕШЬ:\n"
             + "\n".join(f"- {member}" for member in members)
             + "\nНе путай их между собой."
+        )
+
+    personality_data = None
+
+    if user_id is not None:
+        personality_data = get_personality(chat_id, user_id)
+
+    if personality_data:
+        system_prompt += (
+            "\n\nИНДИВИДУАЛЬНЫЙ ХАРАКТЕР СОБЕСЕДНИКА:\n"
+            + personality_data["personality"]
+            + f"\nУровень прожарки: {personality_data['roast_level']} из 5."
+            + "\nУчитывай эти особенности при общении."
         )
 
     
@@ -589,11 +691,18 @@ def webhook():
             message,
             text
         )
+        
+        save_personality_from_message(
+            chat_id,
+            message,
+            text
+        )
+
         # В группе отвечаем только на обращения
         if chat_type in ("group", "supergroup") and not addressed:
             return jsonify(ok=True)
 
-        answer = ask_bradok(chat_id)
+        answer = ask_bradok(chat_id, user_id)
 
         send_message(
             chat_id,
