@@ -17,41 +17,46 @@ RENDER_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
 SYSTEM_PROMPT = """
 Ты Брадок AI, ИИ-помощник Максима (Брадка).
 
-Стиль общения:
-- Разговорный русский язык.
-- Юмор, ирония и живые эмоции.
-- Естественные фразы без канцелярита.
-- Уместные шутки и короткие ответы.
-- Не выдумывай факты.
-- Если чего-то не знаешь, скажи честно.
-- Не выдавай себя за живого Максима.
+Общайся на русском языке.
+Будь разговорным, живым, с юмором и иронией.
+Не используй канцелярит.
+Отвечай естественно и по существу.
+Не выдумывай факты.
+Не выдавай себя за живого Максима.
 """
-
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
-
-def telegram_send(chat_id, text):
-    requests.post(
-        f"{TELEGRAM_API}/sendMessage",
-        json={"chat_id": chat_id, "text": text[:4000]},
-        timeout=20,
-    ).raise_for_status()
 
 
 def setup_webhook():
+    url = f"{RENDER_URL}/webhook"
+
     response = requests.post(
         f"{TELEGRAM_API}/setWebhook",
         json={
-            "url": f"{RENDER_URL}/webhook",
+            "url": url,
             "secret_token": WEBHOOK_SECRET,
         },
         timeout=20,
     )
     response.raise_for_status()
-    logger.info("Webhook configured: %s", response.json())
+
+    logger.info("Webhook setup: %s", response.json())
+
+
+def send_message(chat_id, text):
+    response = requests.post(
+        f"{TELEGRAM_API}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": text[:4000],
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
 
 
 @app.get("/")
@@ -66,14 +71,18 @@ def health():
 
 @app.post("/webhook")
 def webhook():
-    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+    secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token"
+    )
+
+    if secret != WEBHOOK_SECRET:
         return jsonify(error="unauthorized"), 403
 
     update = request.get_json(silent=True) or {}
     message = update.get("message", {})
+
     text = message.get("text")
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
+    chat_id = message.get("chat", {}).get("id")
 
     if not text or not chat_id:
         return jsonify(ok=True)
@@ -86,30 +95,36 @@ def webhook():
                 {"role": "user", "content": text},
             ],
         )
+
         answer = result.choices[0].message.content
-        telegram_send(chat_id, answer or "Что-то завис 😅")
+        send_message(
+            chat_id,
+            answer or "Что-то завис 😅"
+        )
 
     except Exception:
-        logger.exception("Message processing failed")
+        logger.exception("Message processing error")
+
         try:
-            telegram_send(
+            send_message(
                 chat_id,
-                "У меня небольшая техническая заминка. Попробуй ещё раз!"
+                "Небольшая техническая заминка. Попробуй ещё раз!"
             )
         except Exception:
-            logger.exception("Could not send error message")
+            logger.exception("Telegram send error")
 
     return jsonify(ok=True)
 
 
-if __name__ == "__main__":
+# Регистрируем Telegram Webhook при загрузке приложения
+try:
     setup_webhook()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+except Exception:
+    logger.exception("Webhook registration failed")
 
 
-if __name__ != "__main__":
-    # Gunicorn imports this module when starting the service.
-    try:
-        setup_webhook()
-    except Exception:
-        logger.exception("Webhook setup failed")
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
