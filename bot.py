@@ -505,23 +505,20 @@ def ask_bradok(chat_id):
             + "\nНе путай их между собой."
         )
 
+    
     result = client.chat.completions.create(
         model="openai/gpt-oss-120b",
         messages=[
-    {
-        "role": "system",
-        "content": SYSTEM_PROMPT
-        + "\n\nТВОЯ ДОЛГОВРЕМЕННАЯ ПАМЯТЬ О КЕНТАХ:\n"
-        + memory_context
-        + "\nИспользуй эти факты, когда они относятся к разговору. "
-          "Не выдумывай воспоминания."
-    },
-    *history
-],
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            *history
         ],
         temperature=0.9,
         max_tokens=700
     )
+
 
     answer = result.choices[0].message.content
 
