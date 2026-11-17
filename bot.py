@@ -1,3 +1,4 @@
+
 import json
 import os
 import logging
@@ -8,6 +9,11 @@ import psycopg2
 
 from flask import Flask, request, jsonify
 from openai import OpenAI
+
+
+# -------------------------
+# SETTINGS
+# -------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +35,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 MAX_HISTORY = 24
 BOT_USERNAME = None
+
 
 SYSTEM_PROMPT = """
 Ты — Брадок AI, дерзкий, наглый и харизматичный интернет-братан.
@@ -107,18 +114,6 @@ def init_db():
             """)
 
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS personalities (
-                    id BIGSERIAL PRIMARY KEY,
-                    chat_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    personality TEXT NOT NULL,
-                    roast_level INTEGER DEFAULT 2,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE (chat_id, user_id)
-                )
-            """)
-
-            cur.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id BIGSERIAL PRIMARY KEY,
                     chat_id BIGINT NOT NULL,
@@ -154,14 +149,24 @@ def init_db():
                 ON memories (chat_id, user_id)
             """)
 
-
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_memories_user
-                ON memories (chat_id, user_id)
+                CREATE TABLE IF NOT EXISTS personalities (
+                    id BIGSERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    personality TEXT NOT NULL,
+                    roast_level INTEGER DEFAULT 2,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (chat_id, user_id)
+                )
             """)
 
     logger.info("Neon database initialized!")
 
+
+# -------------------------
+# USERS AND MESSAGES
+# -------------------------
 
 def save_user_message(chat_id, message, name, text):
     user = message.get("from", {})
@@ -267,6 +272,12 @@ def get_known_members(chat_id):
             members.append(full_name)
 
     return members
+
+
+# -------------------------
+# LONG-TERM MEMORY
+# -------------------------
+
 def save_memory(chat_id, user_id, fact, category="general"):
     with db_connection() as conn:
         with conn.cursor() as cur:
@@ -285,6 +296,7 @@ def save_memory(chat_id, user_id, fact, category="general"):
 def get_memories(chat_id, user_id=None, limit=30):
     with db_connection() as conn:
         with conn.cursor() as cur:
+
             if user_id is not None:
                 cur.execute("""
                     SELECT fact
@@ -293,6 +305,7 @@ def get_memories(chat_id, user_id=None, limit=30):
                     ORDER BY updated_at DESC
                     LIMIT %s
                 """, (chat_id, user_id, limit))
+
             else:
                 cur.execute("""
                     SELECT fact
@@ -304,83 +317,6 @@ def get_memories(chat_id, user_id=None, limit=30):
 
             return [row[0] for row in cur.fetchall()]
 
-def save_personality(chat_id, user_id, personality, roast_level=2):
-    with db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO personalities (
-                    chat_id, user_id, personality, roast_level
-                )
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (chat_id, user_id)
-                DO UPDATE SET
-                    personality = EXCLUDED.personality,
-                    roast_level = EXCLUDED.roast_level,
-                    updated_at = CURRENT_TIMESTAMP
-            """, (chat_id, user_id, personality, roast_level))
-
-
-def get_personality(chat_id, user_id):
-    
-def save_personality_from_message(chat_id, message, text):
-    user = message.get("from", {})
-    user_id = user.get("id")
-
-    if not user_id or user.get("is_bot"):
-        return
-
-    lowered = text.lower()
-
-    triggers = [
-        "запомни мой характер",
-        "мой характер:",
-        "общайся со мной"
-    ]
-
-    if not any(trigger in lowered for trigger in triggers):
-        return
-
-    if ":" in text:
-        personality = text.split(":", 1)[1].strip()
-    else:
-        personality = text.strip()
-
-    if not personality or len(personality) > 500:
-        return
-
-    roast_level = 2
-
-    if any(word in lowered for word in ["не подкалывай", "без подколов"]):
-        roast_level = 0
-    elif any(word in lowered for word in ["жёстко прожаривай", "подкалывай меня"]):
-        roast_level = 5
-
-    save_personality(
-        chat_id,
-        user_id,
-        personality,
-        roast_level
-    )
-
-    logger.info("Personality saved for user %s", user_id)
-
-    with db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT personality, roast_level
-                FROM personalities
-                WHERE chat_id = %s AND user_id = %s
-            """, (chat_id, user_id))
-
-            row = cur.fetchone()
-
-            if row:
-                return {
-                    "personality": row[0],
-                    "roast_level": row[1]
-                }
-
-            return None
 
 def extract_and_save_memories(chat_id, message, text):
     user = message.get("from", {})
@@ -391,7 +327,6 @@ def extract_and_save_memories(chat_id, message, text):
 
     lowered = text.lower()
 
-    # Не тратим запросы Groq на обычный трёп
     triggers = [
         "запомни", "меня зовут", "я люблю", "обожаю",
         "мне нравится", "мой любимый", "моя любимая",
@@ -449,16 +384,13 @@ def extract_and_save_memories(chat_id, message, text):
         content = result.choices[0].message.content or ""
         content = content.strip()
 
-        # Убираем возможные Markdown-ограждения
         if content.startswith("```"):
             content = content.replace("```json", "", 1)
             content = content.replace("```", "").strip()
 
         data = json.loads(content)
 
-        memories = data.get("memories", [])
-
-        for item in memories[:3]:
+        for item in data.get("memories", [])[:3]:
             fact = item.get("fact", "").strip()
             category = item.get("category", "general")
 
@@ -478,6 +410,97 @@ def extract_and_save_memories(chat_id, message, text):
 
     except Exception:
         logger.exception("Memory extraction failed")
+
+
+# -------------------------
+# PERSONALITIES
+# -------------------------
+
+def save_personality(chat_id, user_id, personality, roast_level=2):
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO personalities (
+                    chat_id, user_id, personality, roast_level
+                )
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (chat_id, user_id)
+                DO UPDATE SET
+                    personality = EXCLUDED.personality,
+                    roast_level = EXCLUDED.roast_level,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (chat_id, user_id, personality, roast_level))
+
+
+def get_personality(chat_id, user_id):
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT personality, roast_level
+                FROM personalities
+                WHERE chat_id = %s AND user_id = %s
+            """, (chat_id, user_id))
+
+            row = cur.fetchone()
+
+            if row:
+                return {
+                    "personality": row[0],
+                    "roast_level": row[1]
+                }
+
+            return None
+
+
+def save_personality_from_message(chat_id, message, text):
+    user = message.get("from", {})
+    user_id = user.get("id")
+
+    if not user_id or user.get("is_bot"):
+        return
+
+    lowered = text.lower()
+
+    triggers = [
+        "запомни мой характер",
+        "мой характер:",
+        "общайся со мной"
+    ]
+
+    if not any(trigger in lowered for trigger in triggers):
+        return
+
+    if ":" in text:
+        personality = text.split(":", 1)[1].strip()
+    else:
+        personality = text.strip()
+
+    if not personality or len(personality) > 500:
+        return
+
+    roast_level = 2
+
+    if any(word in lowered for word in [
+        "не подкалывай",
+        "без подколов"
+    ]):
+        roast_level = 0
+
+    elif any(word in lowered for word in [
+        "жёстко прожаривай",
+        "подкалывай меня"
+    ]):
+        roast_level = 5
+
+    save_personality(
+        chat_id,
+        user_id,
+        personality,
+        roast_level
+    )
+
+    logger.info("Personality saved for user %s", user_id)
+
 
 # -------------------------
 # TELEGRAM
@@ -570,11 +593,11 @@ def is_addressed(message, text, chat_type):
 # GROQ AI
 # -------------------------
 
-
 def ask_bradok(chat_id, user_id=None):
     history = get_history(chat_id)
 
-    memories = get_memories(chat_id)
+    # Загружаем личные воспоминания собеседника
+    memories = get_memories(chat_id, user_id)
 
     if memories:
         memory_context = "\n".join(
@@ -594,6 +617,14 @@ def ask_bradok(chat_id, user_id=None):
             + "\nНе путай их между собой."
         )
 
+    system_prompt += (
+        "\n\nТВОЯ ДОЛГОВРЕМЕННАЯ ПАМЯТЬ О СОБЕСЕДНИКЕ:\n"
+        + memory_context
+        + "\nИспользуй эти факты, когда они относятся к разговору. "
+        "Не выдумывай воспоминания."
+    )
+
+    # Загружаем индивидуальный характер
     personality_data = None
 
     if user_id is not None:
@@ -603,11 +634,11 @@ def ask_bradok(chat_id, user_id=None):
         system_prompt += (
             "\n\nИНДИВИДУАЛЬНЫЙ ХАРАКТЕР СОБЕСЕДНИКА:\n"
             + personality_data["personality"]
-            + f"\nУровень прожарки: {personality_data['roast_level']} из 5."
+            + f"\nУровень прожарки: "
+            f"{personality_data['roast_level']} из 5."
             + "\nУчитывай эти особенности при общении."
         )
 
-    
     result = client.chat.completions.create(
         model="openai/gpt-oss-120b",
         messages=[
@@ -620,7 +651,6 @@ def ask_bradok(chat_id, user_id=None):
         temperature=0.9,
         max_tokens=700
     )
-
 
     answer = result.choices[0].message.content
 
@@ -669,11 +699,13 @@ def webhook():
     if text.startswith("/"):
         return jsonify(ok=True)
 
+    user = message.get("from", {})
+    user_id = user.get("id")
+
     name = get_user_name(message)
     addressed = is_addressed(message, text, chat_type)
 
     try:
-        # Сохраняем сообщение и участника в Neon
         inserted = save_user_message(
             chat_id,
             message,
@@ -681,24 +713,25 @@ def webhook():
             text
         )
 
-        # Защита от повторной обработки одного сообщения
+        # Не обрабатываем повторно одно и то же сообщение
         if not inserted:
             return jsonify(ok=True)
 
-                # Автоматически извлекаем важные воспоминания
+        # Сохраняем воспоминания
         extract_and_save_memories(
             chat_id,
             message,
             text
         )
-        
+
+        # Сохраняем характер участника
         save_personality_from_message(
             chat_id,
             message,
             text
         )
 
-        # В группе отвечаем только на обращения
+        # В группе отвечаем только на обращения к боту
         if chat_type in ("group", "supergroup") and not addressed:
             return jsonify(ok=True)
 
