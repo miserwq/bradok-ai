@@ -2,14 +2,13 @@
 import json
 import os
 import logging
-import asyncio
 import tempfile
 
 from contextlib import contextmanager
 
 import requests
 import psycopg2
-import edge_tts
+from gtts import gTTS
 
 from flask import Flask, request, jsonify
 from openai import OpenAI
@@ -643,6 +642,7 @@ def handle_roast_command(chat_id, message):
     )
 
 
+
 # -------------------------
 # VOICE MODE
 # -------------------------
@@ -661,34 +661,33 @@ def wants_voice(text):
         "голосовое сообщение"
     ]
 
-    return any(trigger in lowered for trigger in triggers)
+    return any(word in lowered for word in triggers)
 
 
-async def create_voice_file(text, file_path):
-    communicate = edge_tts.Communicate(
+def create_voice_file(text, file_path):
+    tts = gTTS(
         text=text,
-        voice=TTS_VOICE,
-        rate="+0%",
-        volume="+0%"
+        lang="ru",
+        slow=False
     )
 
-    await communicate.save(file_path)
+    tts.save(file_path)
 
 
 def send_voice(chat_id, text, reply_to=None):
     file_path = None
 
     try:
+        import tempfile
+
         with tempfile.NamedTemporaryFile(
             suffix=".mp3",
             delete=False
         ) as temp_file:
             file_path = temp_file.name
 
-        # Создаём озвучку
-        asyncio.run(
-            create_voice_file(text, file_path)
-        )
+        # Создаём русскую озвучку
+        create_voice_file(text, file_path)
 
         data = {
             "chat_id": chat_id
@@ -697,7 +696,7 @@ def send_voice(chat_id, text, reply_to=None):
         if reply_to:
             data["reply_to_message_id"] = reply_to
 
-        # Отправляем именно голосовое сообщение
+        # Отправляем голосовое в Telegram
         with open(file_path, "rb") as audio:
             response = requests.post(
                 f"{TELEGRAM_API}/sendVoice",
@@ -720,7 +719,7 @@ def send_voice(chat_id, text, reply_to=None):
                 f"Telegram voice error: {result}"
             )
 
-        logger.info("Voice message sent!")
+        logger.info("Voice message sent successfully!")
 
     except Exception:
         logger.exception("Voice generation or sending failed")
