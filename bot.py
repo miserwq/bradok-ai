@@ -1,75 +1,115 @@
 
 import os
 import logging
-from telegram import Update
-from telegram.ext import (
-    Application,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from openai import AsyncOpenAI
+import requests
+from flask import Flask, request, jsonify
+from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+app = Flask(__name__)
+
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
+RENDER_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 SYSTEM_PROMPT = """
-Ты Брадок AI, цифровой помощник Максима (Брадка).
+Ты Брадок AI, ИИ-помощник Максима (Брадка).
 
-Твой стиль общения:
+Стиль общения:
 - Разговорный русский язык.
 - Юмор, ирония и живые эмоции.
-- Общайся естественно, без канцелярита.
-- Используй короткие и уместные шутки.
-- Не будь навязчивым и не выдумывай факты.
-- Если не знаешь ответа, честно скажи об этом.
-
-Ты ИИ-помощник, а не сам Максим.
-Не утверждай, что ты человек или что лично совершал действия.
+- Естественные фразы без канцелярита.
+- Уместные шутки и короткие ответы.
+- Не выдумывай факты.
+- Если чего-то не знаешь, скажи честно.
+- Не выдавай себя за живого Максима.
 """
 
-async def handle_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    if not update.message or not update.message.text:
-        return
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-    user_text = update.message.text
-    chat_id = update.effective_chat.id
+
+def telegram_send(chat_id, text):
+    requests.post(
+        f"{TELEGRAM_API}/sendMessage",
+        json={"chat_id": chat_id, "text": text[:4000]},
+        timeout=20,
+    ).raise_for_status()
+
+
+def setup_webhook():
+    response = requests.post(
+        f"{TELEGRAM_API}/setWebhook",
+        json={
+            "url": f"{RENDER_URL}/webhook",
+            "secret_token": WEBHOOK_SECRET,
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    logger.info("Webhook configured: %s", response.json())
+
+
+@app.get("/")
+def home():
+    return "Bradok AI is alive!"
+
+
+@app.get("/health")
+def health():
+    return jsonify(status="ok")
+
+
+@app.post("/webhook")
+def webhook():
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        return jsonify(error="unauthorized"), 403
+
+    update = request.get_json(silent=True) or {}
+    message = update.get("message", {})
+    text = message.get("text")
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+
+    if not text or not chat_id:
+        return jsonify(ok=True)
 
     try:
-        response = await client.chat.completions.create(
+        result = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_text},
+                {"role": "user", "content": text},
             ],
         )
-
-        answer = response.choices[0].message.content
-        await update.message.reply_text(answer or "Что-то я завис 😅")
+        answer = result.choices[0].message.content
+        telegram_send(chat_id, answer or "Что-то завис 😅")
 
     except Exception:
-        logger.exception("Ошибка при обработке сообщения")
-        await update.message.reply_text(
-            "У меня небольшая техническая заминка. Попробуй ещё раз!"
-        )
+        logger.exception("Message processing failed")
+        try:
+            telegram_send(
+                chat_id,
+                "У меня небольшая техническая заминка. Попробуй ещё раз!"
+            )
+        except Exception:
+            logger.exception("Could not send error message")
 
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    return jsonify(ok=True)
 
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
-
-    logger.info("Брадок AI запущен!")
-    app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    setup_webhook()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
+
+if __name__ != "__main__":
+    # Gunicorn imports this module when starting the service.
+    try:
+        setup_webhook()
+    except Exception:
+        logger.exception("Webhook setup failed")
