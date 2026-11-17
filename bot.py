@@ -106,6 +106,7 @@ def init_db():
                 )
             """)
 
+           
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id BIGSERIAL PRIMARY KEY,
@@ -123,7 +124,8 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_messages_chat_id
                 ON messages (chat_id, id DESC)
             """)
-                        cur.execute("""
+
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS memories (
                     id BIGSERIAL PRIMARY KEY,
                     chat_id BIGINT NOT NULL,
@@ -135,6 +137,12 @@ def init_db():
                     UNIQUE (chat_id, user_id, fact)
                 )
             """)
+
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_memories_user
+                ON memories (chat_id, user_id)
+            """)
+
 
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_memories_user
