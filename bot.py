@@ -8,6 +8,7 @@ from contextlib import contextmanager
 
 import requests
 import psycopg2
+from psycopg2.extras import Json
 from gtts import gTTS
 
 from flask import Flask, request, jsonify
@@ -31,7 +32,9 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 
 client = OpenAI(
     api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1"
+    base_url="https://api.groq.com/openai/v1",
+    timeout=30.0,
+    max_retries=1
 )
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -212,10 +215,124 @@ def init_db():
                     UNIQUE (chat_id, user_id)
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS webhook_jobs (
+                    update_id BIGINT PRIMARY KEY,
+                    payload JSONB NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    response_text TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    locked_until TIMESTAMPTZ,
+                    last_error TEXT,
+                    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
 
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_webhook_jobs_status
+                ON webhook_jobs (status, locked_until)
+            """)
+            
     logger.info("Neon database initialized!")
 
+# -------------------------
+# WEBHOOK JOB QUEUE
+# -------------------------
 
+def register_update(update_id, update):
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO webhook_jobs (update_id, payload)
+                VALUES (%s, %s)
+                ON CONFLICT (update_id) DO NOTHING
+            """, (update_id, Json(update)))
+
+
+def claim_update(update_id):
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE webhook_jobs
+                SET
+                    status = 'processing',
+                    attempts = attempts + 1,
+                    locked_until = CURRENT_TIMESTAMP + INTERVAL '3 minutes',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE update_id = %s
+                  AND status != 'done'
+                  AND (
+                      status != 'processing'
+                      OR locked_until < CURRENT_TIMESTAMP
+                  )
+                RETURNING payload, response_text
+            """, (update_id,))
+
+            row = cur.fetchone()
+
+            if not row:
+                return None
+
+            return {
+                "payload": row[0],
+                "response_text": row[1]
+            }
+
+
+def get_update_status(update_id):
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT status
+                FROM webhook_jobs
+                WHERE update_id = %s
+            """, (update_id,))
+
+            row = cur.fetchone()
+            return row[0] if row else None
+
+
+def save_update_response(update_id, response_text):
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE webhook_jobs
+                SET
+                    response_text = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE update_id = %s
+                  AND response_text IS NULL
+            """, (response_text, update_id))
+
+
+def complete_update(update_id):
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE webhook_jobs
+                SET
+                    status = 'done',
+                    locked_until = NULL,
+                    last_error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE update_id = %s
+            """, (update_id,))
+
+
+def release_update(update_id, error):
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE webhook_jobs
+                SET
+                    status = 'pending',
+                    locked_until = NULL,
+                    last_error = %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE update_id = %s
+                  AND status != 'done'
+            """, (str(error)[:2000], update_id))
 # -------------------------
 # USERS AND MESSAGES
 # -------------------------
