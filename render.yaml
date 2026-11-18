@@ -5,5 +5,5 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn bot:app
+    startCommand: gunicorn --workers 1 --threads 4 --timeout 180 bot:app
     autoDeploy: true
