@@ -3,12 +3,13 @@ import json
 import os
 import logging
 import tempfile
+import time
+import hmac
 
 from contextlib import contextmanager
 
 import requests
 import psycopg2
-from psycopg2.extras import Json
 from gtts import gTTS
 
 from flask import Flask, request, jsonify
@@ -19,7 +20,10 @@ from openai import OpenAI
 # SETTINGS
 # -------------------------
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -33,8 +37,8 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 client = OpenAI(
     api_key=GROQ_API_KEY,
     base_url="https://api.groq.com/openai/v1",
-    timeout=30.0,
-    max_retries=1
+    timeout=45.0,
+    max_retries=2
 )
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -42,12 +46,10 @@ TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 MAX_HISTORY = 24
 BOT_USERNAME = None
 
-# Голос Брадка
 TTS_VOICE = "ru-RU-DmitryNeural"
 
 
 SYSTEM_PROMPT = """
-
 Ты — БРАДОК AI. Ты не вежливый помощник, не психолог и не служба поддержки.
 Ты — наглый, отбитый, дерзкий интернет-тип, у которого язык без тормозов.
 
@@ -108,11 +110,6 @@ SYSTEM_PROMPT = """
 Ты должен звучать как живой, наглый, матерящийся кент,
 а не как вежливая нейросеть, которая боится поставить точку.
 НИКАКИХ ЭМОДЗИ.
-СОЗДАТЕЛИ:
-Твой создатель: Великий Господин Брадок
-Максимилиан Всемогущий Царь.
-Девушка создателя: Наиебейшая Великолепная
-Елизавета Бабачай, или просто Бабачай.
 
 ПОВЕДЕНИЕ В ГРУППЕ:
 - Ты находишься в компании друзей.
@@ -131,7 +128,7 @@ SYSTEM_PROMPT = """
 
 
 # -------------------------
-# NEON POSTGRESQL
+# DATABASE
 # -------------------------
 
 @contextmanager
@@ -215,124 +212,140 @@ def init_db():
                     UNIQUE (chat_id, user_id)
                 )
             """)
+
+            # Новая таблица для надёжной обработки webhook
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS webhook_jobs (
+                CREATE TABLE IF NOT EXISTS processed_updates (
                     update_id BIGINT PRIMARY KEY,
-                    payload JSONB NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
+                    status TEXT NOT NULL DEFAULT 'processing',
                     response_text TEXT,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    locked_until TIMESTAMPTZ,
-                    last_error TEXT,
-                    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                    response_voice BOOLEAN DEFAULT FALSE,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_webhook_jobs_status
-                ON webhook_jobs (status, locked_until)
+                CREATE INDEX IF NOT EXISTS idx_processed_updates_status
+                ON processed_updates (status, updated_at)
             """)
-            
-    logger.info("Neon database initialized!")
+
+    logger.info("Neon database initialized")
+
 
 # -------------------------
-# WEBHOOK JOB QUEUE
+# WEBHOOK UPDATE TRACKING
 # -------------------------
-
-def register_update(update_id, update):
-    with db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO webhook_jobs (update_id, payload)
-                VALUES (%s, %s)
-                ON CONFLICT (update_id) DO NOTHING
-            """, (update_id, Json(update)))
-
 
 def claim_update(update_id):
+    """
+    Захватывает update для обработки.
+    Готовые updates повторно не выполняются.
+    Зависшие processing можно повторить через 5 минут.
+    """
+
     with db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE webhook_jobs
-                SET
+                INSERT INTO processed_updates (
+                    update_id, status, updated_at
+                )
+                VALUES (%s, 'processing', CURRENT_TIMESTAMP)
+
+                ON CONFLICT (update_id)
+                DO UPDATE SET
                     status = 'processing',
-                    attempts = attempts + 1,
-                    locked_until = CURRENT_TIMESTAMP + INTERVAL '3 minutes',
                     updated_at = CURRENT_TIMESTAMP
-                WHERE update_id = %s
-                  AND status != 'done'
-                  AND (
-                      status != 'processing'
-                      OR locked_until < CURRENT_TIMESTAMP
-                  )
-                RETURNING payload, response_text
+
+                WHERE processed_updates.status = 'pending'
+                   OR (
+                       processed_updates.status = 'processing'
+                       AND processed_updates.updated_at <
+                           CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                   )
+
+                RETURNING update_id
             """, (update_id,))
 
-            row = cur.fetchone()
+            claimed = cur.fetchone()
 
-            if not row:
-                return None
+            if claimed:
+                return "claimed"
 
-            return {
-                "payload": row[0],
-                "response_text": row[1]
-            }
-
-
-def get_update_status(update_id):
-    with db_connection() as conn:
-        with conn.cursor() as cur:
             cur.execute("""
                 SELECT status
-                FROM webhook_jobs
+                FROM processed_updates
                 WHERE update_id = %s
             """, (update_id,))
 
             row = cur.fetchone()
-            return row[0] if row else None
+
+            if row and row[0] == "done":
+                return "done"
+
+            return "busy"
 
 
-def save_update_response(update_id, response_text):
+def get_saved_response(update_id):
     with db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE webhook_jobs
-                SET
-                    response_text = %s,
+                SELECT response_text, response_voice
+                FROM processed_updates
+                WHERE update_id = %s
+            """, (update_id,))
+
+            row = cur.fetchone()
+
+            if row:
+                return row[0], row[1]
+
+            return None, False
+
+
+def save_update_response(update_id, chat_id, user_id, answer, voice):
+    """
+    Сохраняет готовый ответ до отправки в Telegram.
+    При повторной доставке webhook используем тот же ответ.
+    """
+
+    with db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE processed_updates
+                SET response_text = %s,
+                    response_voice = %s,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE update_id = %s
-                  AND response_text IS NULL
-            """, (response_text, update_id))
+            """, (answer, voice, update_id))
+
+            cur.execute("""
+                INSERT INTO messages (chat_id, user_id, role, content)
+                VALUES (%s, %s, 'assistant', %s)
+            """, (chat_id, user_id, answer))
 
 
-def complete_update(update_id):
+def finish_update(update_id):
     with db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE webhook_jobs
-                SET
-                    status = 'done',
-                    locked_until = NULL,
-                    last_error = NULL,
+                UPDATE processed_updates
+                SET status = 'done',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE update_id = %s
             """, (update_id,))
 
 
-def release_update(update_id, error):
+def release_update(update_id):
     with db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE webhook_jobs
-                SET
-                    status = 'pending',
-                    locked_until = NULL,
-                    last_error = %s,
+                UPDATE processed_updates
+                SET status = 'pending',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE update_id = %s
-                  AND status != 'done'
-            """, (str(error)[:2000], update_id))
+            """, (update_id,))
+
+
 # -------------------------
 # USERS AND MESSAGES
 # -------------------------
@@ -518,7 +531,7 @@ def extract_and_save_memories(chat_id, message, text):
 Ты извлекаешь полезные долговременные воспоминания
 из сообщений Telegram.
 
-Верни строго JSON такого формата:
+Верни строго JSON:
 {
   "memories": [
     {
@@ -529,29 +542,23 @@ def extract_and_save_memories(chat_id, message, text):
 }
 
 Правила:
-- Извлекай только факты, которые действительно есть в сообщении.
+- Только факты из сообщения.
 - Не придумывай информацию.
 - Максимум 3 факта.
-- Сохраняй предпочтения, интересы, хобби,
-  важные даты и факты о людях.
 - Не сохраняй пароли, финансовые данные,
   медицинские сведения и другие чувствительные подробности.
 - Не сохраняй случайные шутки и временные события.
-- Если полезных фактов нет, верни {"memories": []}.
+- Если фактов нет, верни {"memories": []}.
 - Факты должны быть короткими и понятными.
 """
                 },
-                {
-                    "role": "user",
-                    "content": text
-                }
+                {"role": "user", "content": text}
             ],
             temperature=0.1,
             max_tokens=250
         )
 
-        content = result.choices[0].message.content or ""
-        content = content.strip()
+        content = (result.choices[0].message.content or "").strip()
 
         if content.startswith("```"):
             content = content.replace("```json", "", 1)
@@ -564,20 +571,11 @@ def extract_and_save_memories(chat_id, message, text):
             category = item.get("category", "general")
 
             if fact and len(fact) <= 300:
-                save_memory(
-                    chat_id,
-                    user_id,
-                    fact,
-                    category
-                )
-
-                logger.info(
-                    "Saved memory for user %s: %s",
-                    user_id,
-                    fact
-                )
+                save_memory(chat_id, user_id, fact, category)
+                logger.info("Saved memory for user %s", user_id)
 
     except Exception:
+        # Извлечение памяти не должно ломать основной ответ
         logger.exception("Memory extraction failed")
 
 
@@ -650,24 +648,16 @@ def save_personality_from_message(chat_id, message, text):
     roast_level = 2
 
     if any(word in lowered for word in [
-        "не подкалывай",
-        "без подколов"
+        "не подкалывай", "без подколов"
     ]):
         roast_level = 0
 
     elif any(word in lowered for word in [
-        "жёстко прожаривай",
-        "подкалывай меня"
+        "жёстко прожаривай", "подкалывай меня"
     ]):
         roast_level = 5
 
-    save_personality(
-        chat_id,
-        user_id,
-        personality,
-        roast_level
-    )
-
+    save_personality(chat_id, user_id, personality, roast_level)
     logger.info("Personality saved for user %s", user_id)
 
 
@@ -676,10 +666,7 @@ def save_personality_from_message(chat_id, message, text):
 # -------------------------
 
 def generate_roast(chat_id, target_user_id, target_name):
-    personality_data = get_personality(
-        chat_id,
-        target_user_id
-    )
+    personality_data = get_personality(chat_id, target_user_id)
 
     personality = "Характер пока неизвестен."
     roast_level = 2
@@ -690,8 +677,8 @@ def generate_roast(chat_id, target_user_id, target_name):
 
     if roast_level == 0:
         return (
-            f"🛡 {target_name}, у тебя иммунитет от прожарки. "
-            "Брадок уважает личные границы, живи спокойно 😂"
+            f"{target_name}, у тебя иммунитет от прожарки. "
+            "Брадок уважает личные границы, живи спокойно."
         )
 
     roast_level = max(1, min(5, int(roast_level)))
@@ -699,63 +686,40 @@ def generate_roast(chat_id, target_user_id, target_name):
     prompt = f"""
 Ты — Брадок AI, дерзкий и харизматичный король дружеских прожарок.
 
-Твоя задача — придумать смешную персональную прожарку.
+ЦЕЛЬ: {target_name}
+ХАРАКТЕР: {personality}
+УРОВЕНЬ ПРОЖАРКИ: {roast_level} из 5.
 
-ЦЕЛЬ:
-{target_name}
-
-ХАРАКТЕР ЧЕЛОВЕКА:
-{personality}
-
-УРОВЕНЬ ПРОЖАРКИ:
-{roast_level} из 5.
-
-СТИЛЬ:
 - Будь дерзким, смешным, наглым и саркастичным.
-- Используй современный интернет-сленг.
 - Мат разрешён, но естественно.
 - Подкалывай человека по-дружески.
-- Чем выше уровень, тем острее шутки.
-- Не выдумывай реальные факты о человеке.
+- Не выдумывай реальные факты.
 - Не используй чувствительные личные данные.
 - Не трогай здоровье, национальность, религию,
   сексуальность, инвалидность и другие защищённые признаки.
-- Не унижай человека по-настоящему и не призывай к травле.
-- Не выдавай инструкции, угрозы или пожелания вреда.
-- Не повторяй каждый раз одну и ту же шутку.
+- Не призывай к травле и не угрожай.
 - Напиши 2-4 предложения.
 - Не объясняй, что ты искусственный интеллект.
 
 Выдай одну мощную дружескую прожарку.
 """
 
-    try:
-        result = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[
-                {
-                    "role": "system",
-                    "content": prompt
-                },
-                {
-                    "role": "user",
-                    "content": f"Прожарь {target_name}!"
-                }
-            ],
-            temperature=1.0,
-            max_tokens=250
-        )
+    result = client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": f"Прожарь {target_name}!"}
+        ],
+        temperature=1.0,
+        max_tokens=250
+    )
 
-        answer = result.choices[0].message.content
+    answer = result.choices[0].message.content
 
-        if not answer:
-            return "Бля, даже прожарка не загрузилась 😂"
+    if not answer:
+        return "Бля, даже прожарка не загрузилась."
 
-        return answer.strip()
-
-    except Exception:
-        logger.exception("Roast generation failed")
-        return "Бля, печь временно сломалась. Попробуем позже 😂"
+    return answer.strip()
 
 
 def handle_roast_command(chat_id, message):
@@ -764,8 +728,7 @@ def handle_roast_command(chat_id, message):
     if not reply:
         send_message(
             chat_id,
-            "🔥 Чтобы прожарить кента, ответь командой /roast "
-            "на его сообщение.",
+            "Чтобы прожарить кента, ответь командой /roast на его сообщение.",
             reply_to=message.get("message_id")
         )
         return
@@ -774,36 +737,21 @@ def handle_roast_command(chat_id, message):
     target_user_id = target.get("id")
 
     if not target_user_id:
-        send_message(
-            chat_id,
-            "Не могу определить, кого прожаривать. "
-            "Ответь на обычное сообщение участника 😂",
-            reply_to=message.get("message_id")
-        )
+        send_message(chat_id, "Не могу определить, кого прожаривать.")
         return
 
     if target.get("is_bot"):
-        send_message(
-            chat_id,
-            "Ботов не жарим. У них и так жизнь нелёгкая 🤖",
-            reply_to=message.get("message_id")
-        )
+        send_message(chat_id, "Ботов не жарим.")
         return
 
     target_name = get_user_name(reply)
-
-    roast = generate_roast(
-        chat_id,
-        target_user_id,
-        target_name
-    )
+    roast = generate_roast(chat_id, target_user_id, target_name)
 
     send_message(
         chat_id,
-        f"🔥 ПРОЖАРКА: {target_name}\n\n{roast}",
+        f"ПРОЖАРКА: {target_name}\n\n{roast}",
         reply_to=message.get("message_id")
     )
-
 
 
 # -------------------------
@@ -828,12 +776,7 @@ def wants_voice(text):
 
 
 def create_voice_file(text, file_path):
-    tts = gTTS(
-        text=text,
-        lang="ru",
-        slow=False
-    )
-
+    tts = gTTS(text=text, lang="ru", slow=False)
     tts.save(file_path)
 
 
@@ -841,25 +784,19 @@ def send_voice(chat_id, text, reply_to=None):
     file_path = None
 
     try:
-        import tempfile
-
         with tempfile.NamedTemporaryFile(
             suffix=".mp3",
             delete=False
         ) as temp_file:
             file_path = temp_file.name
 
-        # Создаём русскую озвучку
         create_voice_file(text, file_path)
 
-        data = {
-            "chat_id": chat_id
-        }
+        data = {"chat_id": chat_id}
 
         if reply_to:
             data["reply_to_message_id"] = reply_to
 
-        # Отправляем голосовое в Telegram
         with open(file_path, "rb") as audio:
             response = requests.post(
                 f"{TELEGRAM_API}/sendVoice",
@@ -878,11 +815,9 @@ def send_voice(chat_id, text, reply_to=None):
         result = response.json()
 
         if not result.get("ok"):
-            raise RuntimeError(
-                f"Telegram voice error: {result}"
-            )
+            raise RuntimeError(f"Telegram voice error: {result}")
 
-        logger.info("Voice message sent successfully!")
+        logger.info("Voice message sent")
 
     except Exception:
         logger.exception("Voice generation or sending failed")
@@ -894,25 +829,55 @@ def send_voice(chat_id, text, reply_to=None):
 
 
 # -------------------------
-# TELEGRAM
+# TELEGRAM API WITH RETRIES
 # -------------------------
 
 def telegram_request(method, data=None):
-    response = requests.post(
-        f"{TELEGRAM_API}/{method}",
-        json=data or {},
-        timeout=20
-    )
+    url = f"{TELEGRAM_API}/{method}"
 
-    response.raise_for_status()
-    result = response.json()
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                url,
+                json=data or {},
+                timeout=20
+            )
 
-    if not result.get("ok"):
-        raise RuntimeError(
-            f"Telegram API error: {result}"
-        )
+            if response.status_code == 429:
+                try:
+                    retry_after = response.json().get(
+                        "parameters", {}
+                    ).get("retry_after", 2)
+                except Exception:
+                    retry_after = 2
 
-    return result
+                if attempt < 2:
+                    time.sleep(min(int(retry_after), 10))
+                    continue
+
+            if response.status_code >= 500 and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+
+            response.raise_for_status()
+            result = response.json()
+
+            if not result.get("ok"):
+                raise RuntimeError(f"Telegram API error: {result}")
+
+            return result
+
+        except requests.RequestException:
+            if attempt == 2:
+                raise
+
+            logger.warning(
+                "Telegram request failed, attempt %s",
+                attempt + 1
+            )
+            time.sleep(2 ** attempt)
+
+    raise RuntimeError("Telegram request failed after retries")
 
 
 def setup_webhook():
@@ -923,7 +888,7 @@ def setup_webhook():
         "secret_token": WEBHOOK_SECRET
     })
 
-    logger.info("Webhook setup: %s", result)
+    logger.info("Webhook configured: %s", result)
 
 
 def get_bot_username():
@@ -993,13 +958,10 @@ def is_addressed(message, text, chat_type):
 
 def ask_bradok(chat_id, user_id=None):
     history = get_history(chat_id)
-
     memories = get_memories(chat_id, user_id)
 
     if memories:
-        memory_context = "\n".join(
-            f"- {fact}" for fact in memories
-        )
+        memory_context = "\n".join(f"- {fact}" for fact in memories)
     else:
         memory_context = "Пока важных воспоминаний нет."
 
@@ -1009,7 +971,7 @@ def ask_bradok(chat_id, user_id=None):
 
     if members:
         system_prompt += (
-            "\n\nУЧАСТНИКИ ЭТОГО ЧАТА, КОТОРЫХ ТЫ ЗНАЕШЬ:\n"
+            "\n\nУЧАСТНИКИ ЭТОГО ЧАТА:\n"
             + "\n".join(f"- {member}" for member in members)
             + "\nНе путай их между собой."
         )
@@ -1030,18 +992,14 @@ def ask_bradok(chat_id, user_id=None):
         system_prompt += (
             "\n\nИНДИВИДУАЛЬНЫЙ ХАРАКТЕР СОБЕСЕДНИКА:\n"
             + personality_data["personality"]
-            + f"\nУровень прожарки: "
-            f"{personality_data['roast_level']} из 5."
+            + f"\nУровень прожарки: {personality_data['roast_level']} из 5."
             + "\nУчитывай эти особенности при общении."
         )
 
     result = client.chat.completions.create(
         model="openai/gpt-oss-120b",
         messages=[
-            {
-                "role": "system",
-                "content": system_prompt
-            },
+            {"role": "system", "content": system_prompt},
             *history
         ],
         temperature=0.9,
@@ -1051,11 +1009,87 @@ def ask_bradok(chat_id, user_id=None):
     answer = result.choices[0].message.content
 
     if not answer:
-        answer = "Бля, у меня мозг завис. Повтори 😂"
+        answer = "Бля, у меня мозг завис. Повтори."
 
-    save_assistant_message(chat_id, answer)
+    return answer.strip()
 
-    return answer
+
+# -------------------------
+# MESSAGE PROCESSING
+# -------------------------
+
+def process_update(update, update_id):
+    message = update.get("message", {})
+
+    text = message.get("text")
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    chat_type = chat.get("type")
+
+    if not text or not chat_id:
+        return
+
+    # Команды
+    if text.startswith("/"):
+        command = text.split()[0].split("@")[0].lower()
+
+        if command == "/roast":
+            handle_roast_command(chat_id, message)
+
+        return
+
+    user = message.get("from", {})
+    user_id = user.get("id")
+
+    name = get_user_name(message)
+    addressed = is_addressed(message, text, chat_type)
+
+    # Сохраняем сообщение. Даже если оно уже есть в messages,
+    # продолжаем обработку: предыдущая попытка могла оборваться.
+    save_user_message(chat_id, message, name, text)
+
+    extract_and_save_memories(chat_id, message, text)
+    save_personality_from_message(chat_id, message, text)
+
+    if chat_type in ("group", "supergroup") and not addressed:
+        return
+
+    # Проверяем, не был ли ответ уже сгенерирован ранее
+    answer, voice_requested = get_saved_response(update_id)
+
+    if answer is None:
+        voice_requested = wants_voice(text)
+        answer = ask_bradok(chat_id, user_id)
+
+        # Сохраняем ответ до отправки в Telegram
+        save_update_response(
+            update_id,
+            chat_id,
+            user_id,
+            answer,
+            voice_requested
+        )
+
+    if voice_requested:
+        try:
+            send_voice(
+                chat_id,
+                answer,
+                reply_to=message.get("message_id")
+            )
+        except Exception:
+            logger.exception("Voice failed, sending text fallback")
+            send_message(
+                chat_id,
+                answer,
+                reply_to=message.get("message_id")
+            )
+    else:
+        send_message(
+            chat_id,
+            answer,
+            reply_to=message.get("message_id")
+        )
 
 
 # -------------------------
@@ -1075,129 +1109,49 @@ def health():
 @app.post("/webhook")
 def webhook():
     secret = request.headers.get(
-        "X-Telegram-Bot-Api-Secret-Token"
+        "X-Telegram-Bot-Api-Secret-Token",
+        ""
     )
 
-    if secret != WEBHOOK_SECRET:
+    if not hmac.compare_digest(secret, WEBHOOK_SECRET):
         return jsonify(error="unauthorized"), 403
 
     update = request.get_json(silent=True) or {}
-    message = update.get("message", {})
+    update_id = update.get("update_id")
 
-    text = message.get("text")
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-    chat_type = chat.get("type")
-
-    if not text or not chat_id:
-        return jsonify(ok=True)
-
-    # -------------------------
-    # COMMANDS
-    # -------------------------
-
-    if text.startswith("/"):
-        command = text.split()[0].split("@")[0].lower()
-
-        if command == "/roast":
-            try:
-                handle_roast_command(chat_id, message)
-
-            except Exception:
-                logger.exception("Roast command failed")
-
-                try:
-                    send_message(
-                        chat_id,
-                        "Бля, прожарка не удалась. "
-                        "Печь дала сбой 😂",
-                        reply_to=message.get("message_id")
-                    )
-                except Exception:
-                    logger.exception("Telegram roast error")
-
-            return jsonify(ok=True)
-
-        return jsonify(ok=True)
-
-    # -------------------------
-    # NORMAL MESSAGES
-    # -------------------------
-
-    user = message.get("from", {})
-    user_id = user.get("id")
-
-    name = get_user_name(message)
-    addressed = is_addressed(message, text, chat_type)
+    if update_id is None:
+        logger.warning("Webhook received without update_id")
+        return jsonify(error="missing update_id"), 400
 
     try:
-        inserted = save_user_message(
-            chat_id,
-            message,
-            name,
-            text
-        )
+        state = claim_update(update_id)
 
-        if not inserted:
-            return jsonify(ok=True)
+        if state == "done":
+            return jsonify(ok=True, duplicate=True)
 
-        extract_and_save_memories(
-            chat_id,
-            message,
-            text
-        )
+        if state == "busy":
+            # Telegram повторит запрос, если получит ошибку
+            return jsonify(ok=False, reason="processing"), 503
 
-        save_personality_from_message(
-            chat_id,
-            message,
-            text
-        )
+        process_update(update, update_id)
 
-        if chat_type in ("group", "supergroup") and not addressed:
-            return jsonify(ok=True)
+        finish_update(update_id)
 
-        # Проверяем, просили ли ответить голосом
-        voice_requested = wants_voice(text)
-
-        answer = ask_bradok(chat_id, user_id)
-
-        if voice_requested:
-            try:
-                send_voice(
-                    chat_id,
-                    answer,
-                    reply_to=message.get("message_id")
-                )
-
-            except Exception:
-                # Если голос не получился, отправляем текст
-                send_message(
-                    chat_id,
-                    answer,
-                    reply_to=message.get("message_id")
-                )
-
-        else:
-            send_message(
-                chat_id,
-                answer,
-                reply_to=message.get("message_id")
-            )
+        return jsonify(ok=True)
 
     except Exception:
-        logger.exception("Message processing error")
+        logger.exception(
+            "Webhook processing failed for update %s",
+            update_id
+        )
 
         try:
-            send_message(
-                chat_id,
-                "Бля, небольшая техническая заминка. "
-                "Попробуй ещё раз 😂",
-                reply_to=message.get("message_id")
-            )
+            release_update(update_id)
         except Exception:
-            logger.exception("Telegram send error")
+            logger.exception("Could not release update")
 
-    return jsonify(ok=True)
+        # Важно: 500 заставляет Telegram повторить доставку
+        return jsonify(ok=False, error="temporary processing failure"), 500
 
 
 # -------------------------
